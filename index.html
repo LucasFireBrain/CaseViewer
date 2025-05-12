@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>STL Viewer – Smooth Pan & Clean List</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    /* Reset & base */
+    html, body {
+      margin:0; padding:0; height:100%;
+      overflow:hidden; background:#f5f1e5;
+      font-family:sans-serif;
+    }
+    /* Layout */
+    #container { display:flex; height:100%; position:relative; }
+    #backgroundLayer {
+      position:absolute; top:0; left:0;
+      width:100%; height:100%; pointer-events:none; z-index:0;
+    }
+    #sidebar {
+      flex:0 0 300px; background:#aed4c8;
+      padding:10px; box-sizing:border-box;
+      display:flex; flex-direction:column; gap:8px;
+      z-index:2;
+    }
+    #renderCanvas { flex:1; z-index:1; display:block; }
+
+    /* Controls */
+    input, select, button {
+      width:100%; height:4vh; margin:4px 0;
+      box-sizing:border-box; padding:4px;
+      font-size:1.8vh; border-radius:4px;
+      border:1px solid #444; background:#222;
+      color:white;
+    }
+    button { cursor:pointer; }
+
+    /* Model list */
+    #modelList {
+      flex:1; overflow-y:auto;
+      border:1px solid #888; background:rgba(255,255,255,0.2);
+      border-radius:4px; padding:4px;
+    }
+    .model-item {
+      display:flex; align-items:center;
+      padding:2px 6px; margin:2px 0;
+      height:4vh; line-height:4vh;
+      gap:6px; cursor:pointer;
+      background:rgba(255,255,255,0.1);
+      border-radius:2px;
+      user-select:none;
+    }
+    .model-item.selected {
+      background:rgba(0,0,0,0.2);
+    }
+    .model-item .visibility {
+      flex:0 0 auto;
+      width:1.2em; height:1.2em;
+      cursor:pointer;
+    }
+    .model-item .model-name {
+      flex:1; cursor:pointer;
+      color:#111;
+      overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+    }
+
+    /* Properties */
+    #properties { margin-top:8px; }
+    #properties label {
+      display:flex; justify-content:space-between;
+      font-size:1.6vh; margin:2px 0;
+    }
+    #properties span { color:#111; }
+  </style>
+  <script src="https://cdn.babylonjs.com/babylon.js"></script>
+  <script src="https://cdn.babylonjs.com/loaders/babylon.stlFileLoader.js"></script>
+</head>
+<body>
+  <div id="container">
+    <div id="backgroundLayer"></div>
+    <div id="sidebar">
+      <h3>3D Viewer</h3>
+      <input type="file" id="fileInput" accept=".stl" multiple />
+      <select id="lighting">
+        <option value="flat">Flat Ambient</option>
+        <option value="soft">Soft Top Light</option>
+        <option value="directional">Strong Directional</option>
+        <option value="studio">3-Point Studio</option>
+      </select>
+      <select id="bgMode">
+        <option value="solid">Solid</option>
+        <option value="gradient">Radial Gradient</option>
+      </select>
+      <input type="color" id="bgColor1" value="#f5f1e5" />
+      <input type="color" id="bgColor2" value="#ffffff" style="display:none" />
+
+      <div id="modelList"></div>
+
+      <button id="saveBtn">💾 Save Session</button>
+      <button id="loadBtn">📂 Load Session</button>
+      <input type="file" id="loadInput" accept=".json" style="display:none" />
+
+      <div id="properties">
+        <label>Name:  <input type="text" id="objNameInput" /></label>
+        <label>Color: <input type="color" id="objColorInput" value="#ffffff" /></label>
+        <label>Dim:   <span id="dimensions">–</span></label>
+        <label>Faces: <span id="faces">–</span></label>
+      </div>
+    </div>
+    <canvas id="renderCanvas"></canvas>
+  </div>
+
+  <script>
+  // Babylon setup
+  const canvas = document.getElementById("renderCanvas");
+  const engine = new BABYLON.Engine(canvas, true, {
+    preserveDrawingBuffer:true, stencil:true, alpha:true
+  });
+  const scene = new BABYLON.Scene(engine);
+  scene.clearColor = BABYLON.Color3.FromHexString("#f5f1e5").toColor4(1);
+
+  // Camera with orbit + wheel zoom
+  const camera = new BABYLON.ArcRotateCamera(
+    "cam", Math.PI/2, Math.PI/2.8, 20,
+    BABYLON.Vector3.Zero(), scene
+  );
+  camera.attachControl(canvas, true);
+  camera.lowerRadiusLimit = 0.01;
+  camera.upperRadiusLimit = 1e6;
+
+  // Wheel Zoom
+  canvas.addEventListener("wheel", e => {
+    e.preventDefault(); e.stopImmediatePropagation();
+    camera.radius *= Math.pow(0.95, e.deltaY * 0.1);
+  }, { passive:false, capture:true });
+
+  // Double-click to focus
+  canvas.addEventListener("dblclick", e => {
+    const r = canvas.getBoundingClientRect();
+    const pick = scene.pick(e.clientX - r.left, e.clientY - r.top);
+    if (pick.hit) camera.setTarget(pick.pickedPoint);
+  });
+
+  // Shift+Drag panning
+  let panning = false, panStart, camStart;
+  canvas.addEventListener("pointerdown", e => {
+    if (e.button===0 && e.shiftKey) {
+      panning = true;
+      canvas.setPointerCapture(e.pointerId);
+      panStart = { x:e.clientX, y:e.clientY };
+      camStart = {
+        pos: camera.position.clone(),
+        tgt: camera.target.clone()
+      };
+      canvas.style.cursor = "move";
+      e.preventDefault();
+    }
+  });
+  canvas.addEventListener("pointermove", e => {
+    if (!panning) return;
+    // normalized drag vector
+    const dx = (e.clientX - panStart.x)/canvas.clientWidth;
+    const dy = (e.clientY - panStart.y)/canvas.clientHeight;
+    // scale by radius
+    const s = camera.radius;
+    const right = camera.getDirection(BABYLON.Axis.X).scale(-dx * s * 2);
+    const up    = camera.getDirection(BABYLON.Axis.Y).scale( dy * s * 2);
+    camera.position = camStart.pos.add(right).add(up);
+    camera.target   = camStart.tgt.add(right).add(up);
+  });
+  canvas.addEventListener("pointerup", e => {
+    if (panning) {
+      panning = false;
+      canvas.releasePointerCapture(e.pointerId);
+      canvas.style.cursor = "default";
+    }
+  });
+
+  // State
+  let loadedModels = []; // {id,name,base64,material,visible,transform,meshes}
+  let selected = null;
+  let settings = {};
+
+  // Frame utility
+  function frameMeshes(meshes){
+    let min=new BABYLON.Vector3(Infinity,Infinity,Infinity),
+        max=new BABYLON.Vector3(-Infinity,-Infinity,-Infinity);
+    meshes.forEach(m=>{
+      const bb = m.getBoundingInfo().boundingBox;
+      min.minimizeInPlace(bb.minimumWorld);
+      max.maximizeInPlace(bb.maximumWorld);
+    });
+    const center = min.add(max).scale(0.5),
+          radius = BABYLON.Vector3.Distance(center, max);
+    camera.setTarget(center);
+    camera.radius = radius * 3;
+  }
+
+  // Import STL
+  document.getElementById("fileInput").addEventListener("change", evt=>{
+    Array.from(evt.target.files).forEach(file=>{
+      if (!file.name.toLowerCase().endsWith(".stl")) return;
+      const fr = new FileReader();
+      fr.onload = ()=>{
+        const buf = fr.result;
+        // base64 encode
+        const bin = Array.from(new Uint8Array(buf), b=>String.fromCharCode(b)).join("");
+        const b64 = btoa(bin);
+        // blob URL
+        const blob = new Blob([buf], { type:"application/octet-stream" });
+        const url  = URL.createObjectURL(blob);
+
+        BABYLON.SceneLoader.ImportMeshAsync(null, "", url, scene, null, ".stl")
+          .then(res => {
+            const id = file.name.replace(/\s+/g,"_").replace(/\.stl$/i,"");
+            const mat = new BABYLON.StandardMaterial("mat_"+id, scene);
+            mat.diffuseColor = BABYLON.Color3.White();
+            res.meshes.forEach(m=>m.material=mat);
+
+            const entry = {
+              id, name:file.name, base64:b64,
+              material:mat, visible:true,
+              transform:{
+                position:{x:0,y:0,z:0},
+                rotation:{x:0,y:0,z:0},
+                scaling:{x:1,y:1,z:1}
+              },
+              meshes: res.meshes
+            };
+            loadedModels.push(entry);
+            frameMeshes(res.meshes);
+            if (!selected) selectModel(entry);
+            renderModelList();
+          })
+          .catch(console.error);
+      };
+      fr.readAsArrayBuffer(file);
+    });
+  });
+
+  // Lighting
+  function applyLighting(type){
+    scene.lights.forEach(l=>l.dispose());
+    if (type==="flat") {
+      new BABYLON.HemisphericLight("flat",BABYLON.Vector3.Up(),scene);
+    } else if (type==="soft") {
+      new BABYLON.HemisphericLight("soft",BABYLON.Vector3.Up(),scene);
+    } else if (type==="directional") {
+      const L=new BABYLON.DirectionalLight("dir",new BABYLON.Vector3(-1,-2,-1),scene);
+      L.position=new BABYLON.Vector3(20,40,20); L.intensity=1.5;
+    } else {
+      const key = new BABYLON.DirectionalLight("key", new BABYLON.Vector3(-1,-1,-1),scene),
+            fill= new BABYLON.DirectionalLight("fill",new BABYLON.Vector3(1,-1,-1),scene),
+            rim = new BABYLON.DirectionalLight("rim", new BABYLON.Vector3(0,-1,1),scene);
+      key.intensity=1; fill.intensity=0.5; rim.intensity=0.3;
+    }
+  }
+  document.getElementById("lighting")
+    .addEventListener("change", e=>applyLighting(e.target.value));
+  applyLighting("flat");
+
+  // Background
+  const bgMode=document.getElementById("bgMode"),
+        bg1=document.getElementById("bgColor1"),
+        bg2=document.getElementById("bgColor2"),
+        bgLayer=document.getElementById("backgroundLayer");
+  function updateBG(){
+    if (bgMode.value==="solid") {
+      bg2.style.display="none";
+      const c=BABYLON.Color3.FromHexString(bg1.value);
+      scene.clearColor=new BABYLON.Color4(c.r,c.g,c.b,1);
+      bgLayer.style.background="none";
+    } else {
+      bg2.style.display="";
+      scene.clearColor=new BABYLON.Color4(0,0,0,0);
+      bgLayer.style.background =
+        `radial-gradient(circle,${bg1.value} 0%,${bg2.value} 100%)`;
+    }
+  }
+  bgMode.addEventListener("change", updateBG);
+  bg1  .addEventListener("input", updateBG);
+  bg2  .addEventListener("input", updateBG);
+  updateBG();
+
+  // Model list rendering & interaction
+  const modelList = document.getElementById("modelList");
+  modelList.addEventListener("click", e=>{
+    const item = e.target.closest(".model-item");
+    if (!item) return;
+    const id = item.dataset.id;
+    if (e.target.classList.contains("visibility")) {
+      // toggled checkbox
+      const m = loadedModels.find(x=>x.id===id);
+      m.visible = e.target.checked;
+      m.meshes.forEach(mm=>mm.isVisible=m.visible);
+      return;
+    }
+    // select on name click or anywhere else
+    const m = loadedModels.find(x=>x.id===id);
+    selectModel(m);
+    renderModelList();
+  });
+
+  function renderModelList(){
+    modelList.innerHTML="";
+    loadedModels.forEach(m=>{
+      const div=document.createElement("div");
+      div.className="model-item"+(selected===m?" selected":"");
+      div.dataset.id=m.id;
+      const chk=document.createElement("input");
+      chk.type="checkbox"; chk.className="visibility";
+      chk.checked=m.visible;
+      const span=document.createElement("span");
+      span.className="model-name";
+      span.textContent=m.name;
+      div.appendChild(chk);
+      div.appendChild(span);
+      modelList.appendChild(div);
+    });
+  }
+
+  // Selection & properties
+  const nameIn  = document.getElementById("objNameInput"),
+        colorIn = document.getElementById("objColorInput"),
+        dimSpan = document.getElementById("dimensions"),
+        faceSpan= document.getElementById("faces");
+
+  function selectModel(m){
+    selected=m;
+    nameIn.value=m.name;
+    colorIn.value=m.material.diffuseColor.toHexString();
+    // compute dims/faces
+    let min=new BABYLON.Vector3(Infinity,Infinity,Infinity),
+        max=new BABYLON.Vector3(-Infinity,-Infinity,-Infinity),
+        faces=0;
+    m.meshes.forEach(mesh=>{
+      const bb=mesh.getBoundingInfo().boundingBox;
+      min.minimizeInPlace(bb.minimumWorld);
+      max.maximizeInPlace(bb.maximumWorld);
+      faces+=mesh.getTotalIndices()/3;
+    });
+    const d=max.subtract(min);
+    dimSpan.textContent=`${d.x.toFixed(2)}×${d.y.toFixed(2)}×${d.z.toFixed(2)}`;
+    faceSpan.textContent=faces;
+  }
+  nameIn.addEventListener("input",()=>{ if(selected){ selected.name=nameIn.value; renderModelList(); }});
+  colorIn.addEventListener("input",()=>{ if(selected) selected.material.diffuseColor=BABYLON.Color3.FromHexString(colorIn.value); });
+
+  // Save / Load with embedded base64
+  document.getElementById("saveBtn").addEventListener("click", ()=>{
+    settings.lighting  = document.getElementById("lighting").value;
+    settings.background = { mode:bgMode.value, color1:bg1.value, color2:bg2.value };
+    settings.camera     = {
+      alpha:camera.alpha, beta:camera.beta,
+      radius:camera.radius, target:camera.target.asArray()
+    };
+    const models = loadedModels.map(m=>({
+      id:m.id,name:m.name,base64:m.base64,
+      visible:m.visible,
+      material:{color:m.material.diffuseColor.toHexString()},
+      transform:m.transform
+    }));
+    const blob = new Blob([JSON.stringify({settings,models},null,2)], {type:"application/json"});
+    const a=document.createElement("a");
+    a.href=URL.createObjectURL(blob);
+    a.download="session.json";
+    a.click();
+  });
+  document.getElementById("loadBtn").addEventListener("click", ()=>document.getElementById("loadInput").click());
+  document.getElementById("loadInput").addEventListener("change", evt=>{
+    const file=evt.target.files[0]; if(!file) return;
+    const fr=new FileReader();
+    fr.onload=()=>{
+      try {
+        const data=JSON.parse(fr.result);
+        // dispose old
+        loadedModels.forEach(m=>m.meshes.forEach(x=>x.dispose()));
+        loadedModels=[];
+        // settings
+        document.getElementById("lighting").value=data.settings.lighting;
+        applyLighting(data.settings.lighting);
+        bgMode.value=data.settings.background.mode;
+        bg1.value=data.settings.background.color1;
+        bg2.value=data.settings.background.color2;
+        updateBG();
+        camera.alpha=data.settings.camera.alpha;
+        camera.beta =data.settings.camera.beta;
+        camera.radius=data.settings.camera.radius;
+        camera.setTarget(BABYLON.Vector3.FromArray(data.settings.camera.target));
+        // reload models
+        data.models.forEach(md=>{
+          // decode base64
+          const bin=atob(md.base64), arr=new Uint8Array(bin.length);
+          for(let i=0;i<bin.length;i++) arr[i]=bin.charCodeAt(i);
+          const blob=new Blob([arr.buffer],{type:"application/octet-stream"}),
+                url=URL.createObjectURL(blob);
+          BABYLON.SceneLoader.ImportMeshAsync(null,"",url,scene,null,".stl")
+            .then(res=>{
+              const mat=new BABYLON.StandardMaterial("mat_"+md.id,scene);
+              mat.diffuseColor=BABYLON.Color3.FromHexString(md.material.color);
+              res.meshes.forEach(m=>m.material=mat);
+              // transforms
+              res.meshes.forEach(m=>{
+                m.position = BABYLON.Vector3.FromArray([
+                  md.transform.position.x,md.transform.position.y,md.transform.position.z
+                ]);
+                m.rotation = BABYLON.Vector3.FromArray([
+                  md.transform.rotation.x,md.transform.rotation.y,md.transform.rotation.z
+                ]);
+                m.scaling  = BABYLON.Vector3.FromArray([
+                  md.transform.scaling.x,md.transform.scaling.y,md.transform.scaling.z
+                ]);
+              });
+              const entry={ id:md.id,name:md.name,base64:md.base64,
+                            material:mat,visible:md.visible,
+                            transform:md.transform,meshes:res.meshes };
+              loadedModels.push(entry);
+              frameMeshes(res.meshes);
+              renderModelList();
+            })
+            .catch(console.error);
+        });
+      } catch(e) {
+        console.error(e);
+        alert("Invalid session file");
+      }
+    };
+    fr.readAsText(file);
+  });
+
+  // Kickoff
+  renderModelList();
+  engine.runRenderLoop(()=>scene.render());
+  window.addEventListener("resize",()=>engine.resize());
+  </script>
+</body>
+</html>
